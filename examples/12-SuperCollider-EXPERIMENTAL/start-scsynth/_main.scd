@@ -28,6 +28,8 @@ s.options.blockSize = 16;
 s.options.numInputBusChannels = 2;
 s.options.numOutputBusChannels = 2;
 
+s.options.maxLogins = 5; // multiple logins ensures that you can connect to/from your host computer without problem multiple times.
+
 s.options.postln;
 
 s.boot;
