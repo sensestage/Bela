@@ -2,7 +2,7 @@
 # This script uploads Pd patches to Enzienaudio's server and compiles them on Bela
 
 pdpath=
-release=r2016.08
+release=
 NO_UPLOAD=0
 WATCH=0
 FORCE=0
@@ -10,6 +10,7 @@ COMMAND_ARGS=
 RUN_PROJECT=1
 RUN_MODE=foreground
 EXPERT=0
+PRE_BUILT=1
 
 BELA_PYTHON27=
 
@@ -57,7 +58,9 @@ information available here https://github.com/BelaPlatform/Bela/wiki/Running-Pur
 
 Heavy-specific options:
 	-r : builds against a specific Heavy release. Default is: $release (stable)
-            ( see revision list here https://enzienaudio.com/a/releases )
+		( see revision list here https://enzienaudio.com/a/releases )
+	--src-only : only retrieve the source files (and not the pre-built object files). With this option
+		selected, building the project will take longer but you can save bandwidth and tweak compiler options.
 	--noupload : does not use the online compiler, only compiles the current source files.
 	-o arg : sets the path where files returned from the online compiler are stored.
 "
@@ -111,6 +114,9 @@ do
 			shift
 			release=$1
 		;;
+		--src-only )
+			PRE_BUILT=0
+		;;
 		--noupload )
 			NO_UPLOAD=1
 		;;
@@ -143,7 +149,7 @@ if [ -z "$release" ]
 then 
   RELEASE_STRING=
 else 
-  RELEASE_STRING="-r $release"
+  RELEASE_STRING="-rr -r $release"
 fi
 
 
@@ -160,8 +166,6 @@ HEAVY_FILES='Heavy* Hv*'
 # check if project exists
 [ $FORCE -eq 1 ] ||	check_project_exists_prompt $BBB_PROJECT_NAME
 
-#create the destination folder if it does not exist"
-mkdir -p "$projectpath"
 
 reference_time_file="$projectpath"/
 
@@ -172,33 +176,27 @@ uploadBuildRun(){
     if [ $NO_UPLOAD -eq 0 ]; then
         # remove old static files to avoid obsolete errors
         # make sure the path is not empty, so avoiding to rm -rf / by mistake 
-        [ -z $projectpath ] && { echo 'ERROR: $projectpath is empty.'; exit 0; } 
-        # use -rf to prevent warnings in case they do not exist
-        for file in $HEAVY_FILES
-	    do 
-	        rm -rf "$projectpath"/$file
-	    done
+        [ -z "$projectpath" ] && { echo 'ERROR: $projectpath is empty.'; exit 0; } 
+		#empty destination folder
+		rm -rf "$projectpath"
+		#recreate the destination folder"
+		mkdir -p "$projectpath"
         
-		echo "Invoking the online compiler..."
+        echo "Invoking the online compiler..."
+        if [ "$PRE_BUILT" -eq 1 ]
+        then
+            UPLOADER_EXTRA_FLAGS=--archive_only
+            HEAVY_JOB="bela-linux-armv7a"
+        else
+            UPLOADER_EXTRA_FLAGS=
+            HEAVY_JOB="c-src"
+        fi
         # invoke the online compiler
-        "$BELA_PYTHON27" $HVRESOURCES_DIR/uploader.py "$pdpath"/ -n $ENZIENAUDIO_COM_PATCH_NAME -g c -o "$projectpath" $RELEASE_STRING ||\
+        "$BELA_PYTHON27" $HVRESOURCES_DIR/uploader.py "$pdpath"/ -n $ENZIENAUDIO_COM_PATCH_NAME -g $HEAVY_JOB -o "$projectpath" $RELEASE_STRING $UPLOADER_EXTRA_FLAGS ||\
             { echo "ERROR: an error occurred while executing the uploader.py script"; exit $?; }
     fi;
 
     echo "";
-
-    # Test that files have been retrieved from the online compiler.
-	# TODO: skip this now that uplodaer.py returns meaningful exit codes 
-    for file in $HEAVY_FILES;
-    do
-        ls "$projectpath"/$file >/dev/null 2>&1 || { 
-			[ $NO_UPLOAD -eq 0 ] && printf "The online compiler did not return all the files or failed without notice, please try again and/or change HEAVY_FILES to be less strict.\n\n" ||\
-			printf "Folder $projectpath does not contain a valid Heavy project\n";
-			exit 1; }
-    done
-
-    # Apply any Bela-specific patches here
-    # ... none at the moment
 
     BBB_PROJECT_FOLDER=$BBB_PROJECT_HOME"/"$BBB_PROJECT_NAME #make sure there is no trailing slash here
     BBB_NETWORK_TARGET_FOLDER=$BBB_ADDRESS:$BBB_PROJECT_FOLDER
@@ -206,29 +204,53 @@ uploadBuildRun(){
     # check how to copy/sync render.cpp file...
     # check if custom heavy/render.cpp file is provided in the input folder
     # TODO: extend this to all non-Pd files
-    CUSTOM_RENDER_SOURCE_PATH="$pdpath/heavy/render.cpp"
-    if [ -f "$CUSTOM_RENDER_SOURCE_PATH" ]; then
-        echo "Found custom heavy/render.cpp file in input folder, using that one instead of the default one.";
-        cp "$CUSTOM_RENDER_SOURCE_PATH" "$projectpath/render.cpp" || exit 1
+	CUSTOM_HEAVY_SOURCE_PATH="$pdpath/heavy/"
+    if [ -e "$CUSTOM_HEAVY_SOURCE_PATH" ] && [ "$(ls $CUSTOM_HEAVY_SOURCE_PATH)" ]; then
+	# if PROJECTNAME/heavy/ exists and is not empty, then copy the whole folder content 
+        echo "Found custom heavy/ folder in the project folder, using those files instead of the default render.cpp:"
+		ls "$CUSTOM_HEAVY_SOURCE_PATH"
+        cp "$CUSTOM_HEAVY_SOURCE_PATH"/* "$projectpath/" || exit 1
     else
         echo "Using Heavy default render.cpp"
-        cp "$HVRESOURCES_DIR/render.cpp" "$projectpath/render.cpp" || exit 1
+        cp "$HVRESOURCES_DIR/render.cpp" "$projectpath/" || exit 1
     fi
     
     echo "Updating files on board..."
-    # HvContext* files tend to hang when transferring with rsync because they are very large and -c checksum takes a lot, I guess
     
     touch $reference_time_file
+	MAKE_COMMAND_BASE="make --no-print-directory COMPILER=gcc QUIET=true -C $BBB_BELA_HOME PROJECT='$BBB_PROJECT_NAME'"
     # Transfer the files 
+	if [ "$PRE_BUILT" -eq 1 ]
+	then
+		ARCHIVE_NAME=archive.$HEAVY_JOB.zip
+		BBB_ARCHIVE_PATH=/tmp/$ARCHIVE_NAME
+		# copy the archive
+		scp "$projectpath/$ARCHIVE_NAME" $BBB_ADDRESS:$BBB_ARCHIVE_PATH
+		rm "$projectpath/$ARCHIVE_NAME"
+		ssh $BBB_ADDRESS $MAKE_COMMAND_BASE heavy-unzip-archive HEAVY_ARCHIVE=$BBB_ARCHIVE_PATH
+        # in this case, most files at the destination will not exist in the
+        # source folder, as the latter will only contain the zip archive and
+        # any files (if any) from the heavy/ subfolder OR the default heavy
+        # render.cpp, so we avoid deleting them.
+		RSYNC_SHOULD_DELETE=
+	else
+		RSYNC_SHOULD_DELETE=--delete-during
+	fi
 	if [ "$RSYNC_AVAILABLE" -eq 1 ]
 	then
-		echo rsync -ac --out-format="   %n" --no-t --delete-during --exclude='HvContext_'$ENZIENAUDIO_COM_PATCH_NAME'.*' --exclude=build --exclude=$BBB_PROJECT_NAME "$projectpath"/ "$BBB_NETWORK_TARGET_FOLDER"
-		rsync -ac --out-format="   %n" --no-t --delete-during --exclude='HvContext_'$ENZIENAUDIO_COM_PATCH_NAME'.*' --exclude=build --exclude=$BBB_PROJECT_NAME "$projectpath"/ "$BBB_NETWORK_TARGET_FOLDER" &&\
-        { [ $NO_UPLOAD -eq 1 ] || scp -rp "$projectpath"/HvContext* $BBB_NETWORK_TARGET_FOLDER; } ||\
+        # Heavy_bela.cpp tends to hang when transferring with rsync because it
+        # may be very large.
+        # So we always use `scp` with it, also because it changes every time.
+        # In case we are using PRE_BUILT=1, then the file will not even exist
+        # (hence the [ -f ... ] below)
+		BIG_FILE=Heavy_$ENZIENAUDIO_COM_PATCH_NAME.cpp
+
+		rsync -acv --no-t $RSYNC_SHOULD_DELETE --exclude="$BIG_FILE" --exclude=build --exclude=$BBB_PROJECT_NAME "$projectpath"/ "$BBB_NETWORK_TARGET_FOLDER" &&\
+		[ $NO_UPLOAD -eq 1 ] || { [ -f "$projectpath"/$BIG_FILE ] && scp -rp "$projectpath"/$BIG_FILE $BBB_NETWORK_TARGET_FOLDER || true; } ||\
 		{ echo "ERROR: while synchronizing files with the BBB. Is the board connected?"; exit 1; }
 	else
 		echo "using scp..."
-		echo "WARNING: it is HEAVILY recommended that you install rsync on your system when building Heavy projects, in order to make compiling much faster"
+		echo "WARNING: it is HEAVILY recommended that you install rsync on your system when building Heavy projects, in order to make the build much faster"
 		echo "Cleaning the destination folder..."
 		ssh $BBB_ADDRESS "rm -rf \"$BBB_PROJECT_FOLDER\"; mkdir -p \"$BBB_PROJECT_FOLDER\""
 		echo "Copying the project files"
@@ -244,9 +266,7 @@ uploadBuildRun(){
     #    ssh $BBB_ADDRESS "rm -rf "$BBB_PROJECT_FOLDER/$BBB_PROJECT_NAME;
     #fi;
     # Make new Bela executable and run
-    # It does not look very nice that we type the same things over and over
-    # but that is because each line is an ssh session in its own right
-    MAKE_COMMAND="make --no-print-directory QUIET=true -C $BBB_BELA_HOME PROJECT='$BBB_PROJECT_NAME' CL='$COMMAND_ARGS' $BBB_MAKEFILE_OPTIONS"
+    MAKE_COMMAND="$MAKE_COMMAND_BASE CL='$COMMAND_ARGS' $BBB_MAKEFILE_OPTIONS"
     if [ $RUN_PROJECT -eq 0 ]
     then
         echo "Building project..."
